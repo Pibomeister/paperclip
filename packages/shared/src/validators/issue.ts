@@ -615,6 +615,27 @@ export const updateIssueSchema = objectWithoutDefaults(
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;
 
+export const guardedIssueStatusOperationSchema = z.object({
+  operationId: z.string().trim().min(1).max(200),
+  operationKind: z.enum(["guarded_status_update", "guarded_closure", "verified_no_change_closure"]).optional().default("guarded_status_update"),
+  expectedStatus: z.enum(ISSUE_STATUSES),
+  expectedStatusVersion: z.number().int().nonnegative(),
+  expectedMutationVersion: z.number().int().nonnegative(),
+  status: z.enum(ISSUE_STATUSES),
+  comment: multilineTextSchema.pipe(z.string().min(1).max(20_000)).optional(),
+  executionPolicy: issueExecutionPolicySchema.optional().nullable(),
+  closureIdentity: z.string().trim().min(1).max(500).optional(),
+  closureDigest: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+export const guardedIssueClosureSchema = guardedIssueStatusOperationSchema.extend({
+  operationKind: z.enum(["guarded_closure", "verified_no_change_closure"]).optional().default("guarded_closure"),
+  status: z.enum(["done", "cancelled"]),
+});
+
+export type GuardedIssueStatusOperation = z.infer<typeof guardedIssueStatusOperationSchema>;
+export type GuardedIssueClosure = z.infer<typeof guardedIssueClosureSchema>;
+
 export const stalledReviewDecisionSchema = z.object({
   action: z.enum(["approve", "request_changes", "send_back"]),
   note: multilineTextSchema.pipe(z.string().min(1)).optional(),

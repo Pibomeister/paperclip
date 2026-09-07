@@ -5,7 +5,11 @@ import {
   companies,
   companyMemberships,
   createDb,
+  activityLog,
+  agents,
   issues,
+  issueRecoveryActions,
+  issueStatusOperations,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, describe } from "vitest";
@@ -121,6 +125,7 @@ type RouterFactory = (db: Db, storage: never) => Router;
 /** Mounts route modules under `/api` behind a fixed actor, with the real error handler. */
 export function routeApp(db: Db, actor: BoardActor, ...routerFactories: RouterFactory[]) {
   const app = express();
+  app.locals.paperclipDb = db;
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
@@ -138,8 +143,12 @@ export function routeApp(db: Db, actor: BoardActor, ...routerFactories: RouterFa
  * Suites that seed other tables need their own reset.
  */
 export async function resetCompanyIssueFixtures(db: Db) {
+  await db.delete(activityLog);
+  await db.delete(issueStatusOperations);
+  await db.delete(issueRecoveryActions);
   await db.delete(issues).where(isNotNull(issues.parentId));
   await db.delete(issues);
+  await db.delete(agents);
   await db.delete(principalPermissionGrants);
   await db.delete(companyMemberships);
   await db.delete(companies);

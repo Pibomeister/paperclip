@@ -44,6 +44,8 @@ import {
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
   createIssueSchema,
+  guardedIssueClosureSchema,
+  guardedIssueStatusOperationSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   feedbackTargetTypeSchema,
@@ -8810,6 +8812,55 @@ export function issueRoutes(
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
   });
+
+  async function applyGuardedIssueStatusOperation(req: Request, res: Response) {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
+    const issueMutationAccess = await assertAgentIssueMutationAllowed(
+      req,
+      res,
+      existing,
+      { allowVisibleIssueWrite: true },
+    );
+    if (!issueMutationAccess) return;
+    const actor = getActorInfo(req);
+    if (req.body.executionPolicy !== undefined) {
+      const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+      const nextExecutionPolicy = applyActorMonitorScheduledBy(
+        normalizeIssueExecutionPolicy(req.body.executionPolicy),
+        actor.actorType === "user" ? "user" : "agent",
+      );
+      const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
+      await assertCanManageIssueMonitor(access, req, existing.companyId, existing.assigneeAgentId, monitorChanged);
+      req.body.executionPolicy = nextExecutionPolicy;
+    }
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
+    if (activeRecoveryAction) {
+      await requireRecoveryActionAuthority(req, existing, activeRecoveryAction, { source: "issue_update" });
+      if (req.body.status !== undefined && req.body.status !== existing.status) {
+        await requireRecoverySourceMutationAuthority(req, existing);
+      }
+    }
+
+    const result = await svc.applyGuardedStatusOperation(id, req.body, {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId ?? null,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+    });
+    if (!result) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    res.status(result.applied ? 200 : 409).json(result);
+  }
+
+  router.post("/issues/:id/guarded-status", validateIssueMutationBody(guardedIssueStatusOperationSchema), applyGuardedIssueStatusOperation);
+
+  router.post("/issues/:id/guarded-closure", validateIssueMutationBody(guardedIssueClosureSchema), applyGuardedIssueStatusOperation);
 
   router.post("/issues/:id/children", applyCreateIssueStatusDefault, validateIssueMutationBody(createChildIssueSchema), async (req, res) => {
     const parentId = req.params.id as string;

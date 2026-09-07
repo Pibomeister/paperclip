@@ -29,6 +29,7 @@ import {
   issueComments,
   issueDocuments,
   issueReadStates,
+  issueStatusOperations,
   issueThreadInteractions,
   issues,
   labels,
@@ -54,6 +55,7 @@ import type {
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
+  GuardedIssueStatusOperation,
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
@@ -65,7 +67,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -88,6 +90,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { assertIssueReviewVerdictActorAllowed } from "./issue-review-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -186,6 +189,22 @@ function assertTransition(from: string, to: string) {
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
   }
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => stableJson(entry)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function guardedIssueStatusOperationDigest(input: GuardedIssueStatusOperation) {
+  return `sha256:${createHash("sha256").update(stableJson(input)).digest("hex")}`;
 }
 
 function applyStatusSideEffects(
@@ -3204,6 +3223,7 @@ const issueListSelect = {
   `,
   status: issues.status,
   statusVersion: issues.statusVersion,
+  issueMutationVersion: issues.issueMutationVersion,
   lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
@@ -8057,6 +8077,317 @@ export function issueService(db: Db) {
         for (const publication of ownedActivityPublications) publishActivity(publication);
       }
       return result;
+    },
+
+    applyGuardedStatusOperation: async (
+      id: string,
+      input: GuardedIssueStatusOperation,
+      actor: {
+        actorType: "agent" | "user" | "system";
+        actorId: string;
+        agentId?: string | null;
+        userId?: string | null;
+        runId?: string | null;
+        agentApiKeyId?: string | null;
+      },
+    ) => {
+      const digest = guardedIssueStatusOperationDigest(input);
+
+      return db.transaction(async (tx) => {
+        const existing = await tx
+          .select()
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update")
+          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+        if (!existing) return null;
+
+        const replay = await tx
+          .select()
+          .from(issueStatusOperations)
+          .where(and(
+            eq(issueStatusOperations.companyId, existing.companyId),
+            eq(issueStatusOperations.operationId, input.operationId),
+          ))
+          .then((rows: Array<typeof issueStatusOperations.$inferSelect>) => rows[0] ?? null);
+
+        if (replay) {
+          if (replay.issueId !== existing.id || replay.operationDigest !== digest) {
+            throw conflict("Issue status operation idempotency conflict");
+          }
+          const replayResponse = replay.responseJson as {
+            applied: boolean;
+            replayed: boolean;
+            issue: unknown;
+            commentId: string | null;
+            preconditionFailure?: unknown;
+          };
+          return {
+            ...replayResponse,
+            replayed: true,
+          };
+        }
+
+        if (
+          existing.status === "in_review" &&
+          existing.reviewPolicy != null &&
+          existing.reviewPolicy !== "anyone" &&
+          actor.actorType !== "system"
+        ) {
+          await assertIssueReviewVerdictActorAllowed(tx as unknown as Db, {
+            issue: existing,
+            actor: { type: actor.actorType, id: actor.actorId },
+            reviewPolicy: existing.reviewPolicy,
+          });
+        }
+
+        const preconditionFailure =
+          existing.status !== input.expectedStatus ||
+          existing.statusVersion !== input.expectedStatusVersion ||
+          existing.issueMutationVersion !== input.expectedMutationVersion;
+        let updated = existing;
+        let commentId: string | null = null;
+
+        if (!preconditionFailure) {
+          assertTransition(existing.status, input.status);
+          const now = new Date();
+          const normalizedExecutionPolicy = input.executionPolicy !== undefined
+            ? normalizeIssueExecutionPolicy(input.executionPolicy ?? null)
+            : undefined;
+          if (!["in_progress", "in_review", "blocked", "done", "cancelled"].includes(input.status)) {
+            throw unprocessable("Guarded issue status operations only support observer and terminal statuses");
+          }
+          if (
+            existing.status === "blocked" &&
+            input.status !== "blocked" &&
+            input.status !== "done" &&
+            input.status !== "cancelled"
+          ) {
+            throw conflict("Guarded issue status operations cannot resume blocked issues");
+          }
+          if (
+            (existing.status === "done" || existing.status === "cancelled") &&
+            input.status !== existing.status
+          ) {
+            throw conflict("Guarded issue status operations cannot reopen terminal issues");
+          }
+          if (
+            normalizedExecutionPolicy &&
+            (
+              normalizedExecutionPolicy.stages.length > 0 ||
+              normalizedExecutionPolicy.reviewPreset !== undefined ||
+              normalizedExecutionPolicy.authorizationPolicy !== undefined ||
+              normalizedExecutionPolicy.maxReviewRounds != null
+            )
+          ) {
+            throw unprocessable("Guarded issue status operations only support monitor execution policy updates");
+          }
+          if (input.status === "in_progress" && !existing.assigneeAgentId && !existing.assigneeUserId) {
+            throw unprocessable("in_progress issues require an assignee");
+          }
+          if (
+            actor.actorType === "agent" &&
+            actor.agentId &&
+            existing.assigneeAgentId &&
+            actor.agentId !== existing.assigneeAgentId
+          ) {
+            throw forbidden("Agents may only apply guarded issue status operations to their assigned issue");
+          }
+          if (
+            normalizedExecutionPolicy?.monitor &&
+            actor.actorType !== "user" &&
+            actor.agentId !== existing.assigneeAgentId
+          ) {
+            throw forbidden("Only the assignee agent or a board user can manage issue monitors");
+          }
+          const patch: Partial<typeof issues.$inferInsert> = {
+            status: input.status,
+            checkoutRunId: null,
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          };
+          if (normalizedExecutionPolicy !== undefined) {
+            patch.executionPolicy = normalizedExecutionPolicy as Record<string, unknown> | null;
+            if (normalizedExecutionPolicy?.monitor) {
+              Object.assign(
+                patch,
+                buildInitialIssueMonitorFields({
+                  policy: normalizedExecutionPolicy,
+                  status: input.status,
+                  assigneeAgentId: existing.assigneeAgentId,
+                  assigneeUserId: existing.assigneeUserId,
+                }),
+              );
+            }
+          }
+          applyStatusSideEffects(input.status, patch);
+
+          updated = await tx
+            .update(issues)
+            .set(patch)
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null) ?? existing;
+
+          await finalizeSummarySlotsForTerminalIssue(tx, updated as any);
+          const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+          const expiredInteractions = await issueThreadInteractionService(tx as any).expirePendingInteractionsForTerminalIssue(
+            updated,
+            { agentId: actor.agentId ?? null, userId: actor.userId ?? null },
+          );
+          for (const interaction of expiredInteractions) {
+            await logActivity(tx as unknown as Db, {
+              companyId: updated.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+              agentApiKeyId: actor.agentApiKeyId ?? null,
+              action: "issue.thread_interaction_expired",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                identifier: updated.identifier ?? null,
+                interactionId: interaction.id,
+                interactionKind: interaction.kind,
+                interactionStatus: interaction.status,
+                source: "issue.guarded_closure",
+                result: interaction.result ?? null,
+              },
+            });
+          }
+          await finalizeStatusCardsForStalledGeneration(tx, updated as any);
+
+          if (input.comment) {
+            const authorType = issueCommentAuthorTypeSchema.parse(
+              actor.actorType === "agent" ? "agent" : actor.actorType === "user" ? "user" : "system",
+            );
+            assertIssueCommentAuthorTypeAllowed({
+              agentId: actor.agentId ?? null,
+              userId: actor.userId ?? null,
+            }, authorType);
+            const createdByRunId = await resolveCommentCreatedByRunId(tx, updated.companyId, actor.runId);
+            const metadataRows: IssueCommentMetadata["sections"][number]["rows"] = [
+              { type: "key_value", label: "Operation", value: input.operationId },
+              { type: "key_value", label: "Expected status", value: input.expectedStatus },
+              { type: "key_value", label: "Expected status version", value: String(input.expectedStatusVersion) },
+              { type: "key_value", label: "Expected mutation version", value: String(input.expectedMutationVersion) },
+            ];
+            if (input.closureIdentity) {
+              metadataRows.push({ type: "key_value", label: "Closure identity", value: input.closureIdentity });
+            }
+            if (input.closureDigest) {
+              metadataRows.push({ type: "key_value", label: "Closure digest", value: input.closureDigest });
+            }
+            const [comment] = await tx
+              .insert(issueComments)
+              .values({
+                companyId: updated.companyId,
+                issueId: id,
+                authorAgentId: actor.agentId ?? null,
+                authorUserId: actor.userId ?? null,
+                authorType,
+                createdByRunId,
+                body: redactCurrentUserText(input.comment, {
+                  enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+                }),
+                metadata: {
+                  version: 1,
+                  sourceRunId: createdByRunId,
+                  sections: [{
+                    title: "Guarded closure",
+                    rows: metadataRows,
+                  }],
+                },
+              })
+              .returning();
+            commentId = comment.id;
+            updated = await tx
+              .select()
+              .from(issues)
+              .where(eq(issues.id, id))
+              .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null) ?? updated;
+          }
+
+          await logActivity(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId ?? null,
+            runId: actor.runId ?? null,
+            agentApiKeyId: actor.agentApiKeyId ?? null,
+            action: "issue.guarded_closure_applied",
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              operationId: input.operationId,
+              operationKind: input.operationKind,
+              expectedStatus: input.expectedStatus,
+              expectedStatusVersion: input.expectedStatusVersion,
+              expectedMutationVersion: input.expectedMutationVersion,
+              status: input.status,
+              closureIdentity: input.closureIdentity ?? null,
+              closureDigest: input.closureDigest ?? null,
+              commentId,
+              _previous: {
+                status: existing.status,
+                statusVersion: existing.statusVersion,
+                issueMutationVersion: existing.issueMutationVersion,
+              },
+            },
+          });
+        }
+
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        const response = {
+          applied: !preconditionFailure,
+          replayed: false,
+          issue: enriched,
+          commentId,
+          ...(preconditionFailure
+            ? {
+                preconditionFailure: {
+                  actualStatus: existing.status,
+                  actualStatusVersion: existing.statusVersion,
+                  actualMutationVersion: existing.issueMutationVersion,
+                  expectedStatus: input.expectedStatus,
+                  expectedStatusVersion: input.expectedStatusVersion,
+                  expectedMutationVersion: input.expectedMutationVersion,
+                },
+              }
+            : {}),
+        };
+
+        await tx.insert(issueStatusOperations).values({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          operationId: input.operationId,
+          operationDigest: digest,
+          operationKind: input.operationKind,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.userId ?? null,
+          actorRunId: actor.runId ?? null,
+          expectedStatus: input.expectedStatus,
+          expectedStatusVersion: input.expectedStatusVersion,
+          expectedMutationVersion: input.expectedMutationVersion,
+          requestedStatus: input.status,
+          applied: !preconditionFailure,
+          statusBefore: existing.status,
+          statusVersionBefore: existing.statusVersion,
+          mutationVersionBefore: existing.issueMutationVersion,
+          statusAfter: updated.status,
+          statusVersionAfter: updated.statusVersion,
+          mutationVersionAfter: updated.issueMutationVersion,
+          commentId,
+          responseJson: response,
+        });
+
+        return response;
+      });
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
