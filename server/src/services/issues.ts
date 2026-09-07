@@ -8390,6 +8390,29 @@ export function issueService(db: Db) {
       });
     },
 
+    getGuardedStatusOperationReceipt: async (companyId: string, issueId: string, operationId: string) => {
+      const row = await db
+        .select()
+        .from(issueStatusOperations)
+        .where(and(
+          eq(issueStatusOperations.companyId, companyId),
+          eq(issueStatusOperations.issueId, issueId),
+          eq(issueStatusOperations.operationId, operationId),
+        ))
+        .then((rows: Array<typeof issueStatusOperations.$inferSelect>) => rows[0] ?? null);
+      if (!row) return null;
+      return {
+        issueId: row.issueId,
+        operationId: row.operationId,
+        operationKind: row.operationKind,
+        operationDigest: row.operationDigest,
+        applied: row.applied,
+        commentId: row.commentId ?? null,
+        response: row.responseJson,
+        createdAt: row.createdAt.toISOString(),
+      };
+    },
+
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
       const rows = await db
         .select({

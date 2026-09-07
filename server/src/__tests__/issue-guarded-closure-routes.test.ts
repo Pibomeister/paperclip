@@ -115,6 +115,184 @@ describeEmbeddedPostgres("guarded issue closure", () => {
     await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 1, operations: 1 });
   });
 
+  it("reads an applied guarded operation receipt after the original response is lost", async () => {
+    const seeded = await seedIssue();
+    const body = {
+      operationId: "factory:no-change:receipt-lost-response",
+      operationKind: "verified_no_change_closure",
+      expectedStatus: "todo",
+      expectedStatusVersion: 0,
+      expectedMutationVersion: 0,
+      status: "done",
+      comment: "Verified no-change closure receipt.",
+      closureIdentity: "factory-job-receipt:no-change",
+      closureDigest: "sha256:receipt",
+    };
+
+    const applied = await request(seeded.app)
+      .post(`/api/issues/${seeded.issueId}/guarded-closure`)
+      .send(body)
+      .expect(200);
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 1, operations: 1 });
+
+    const receipt = await request(seeded.app)
+      .get(`/api/issues/${seeded.issueId}/guarded-operations/${encodeURIComponent(body.operationId)}`)
+      .expect(200);
+    expect(receipt.body).toMatchObject({
+      issueId: seeded.issueId,
+      operationId: body.operationId,
+      operationKind: "verified_no_change_closure",
+      operationDigest: expect.stringMatching(/^sha256:/),
+      applied: true,
+      commentId: applied.body.commentId,
+      response: {
+        applied: true,
+        replayed: false,
+        issue: { id: seeded.issueId, status: "done" },
+        commentId: applied.body.commentId,
+      },
+    });
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 1, operations: 1 });
+  });
+
+  it("returns 404 for absent guarded operation receipts without creating effects", async () => {
+    const seeded = await seedIssue("in_progress");
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 0, operations: 0 });
+
+    await request(seeded.app)
+      .get(`/api/issues/${seeded.issueId}/guarded-operations/${encodeURIComponent("factory:missing")}`)
+      .expect(404);
+
+    await expect(readIssue(seeded.issueId)).resolves.toMatchObject({ status: "in_progress", statusVersion: 0, issueMutationVersion: 0 });
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 0, operations: 0 });
+  });
+
+  it("does not reveal guarded operation receipts through another issue", async () => {
+    const seeded = await seedIssue();
+    const otherIssueId = randomUUID();
+    const body = {
+      operationId: "factory:no-change:cross-issue",
+      operationKind: "verified_no_change_closure",
+      expectedStatus: "todo",
+      expectedStatusVersion: 0,
+      expectedMutationVersion: 0,
+      status: "done",
+      comment: "Closure belongs to the first issue.",
+    };
+    await ctx.db.insert(issues).values({
+      id: otherIssueId,
+      companyId: seeded.companyId,
+      title: "Other guarded receipt target",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await request(seeded.app)
+      .post(`/api/issues/${seeded.issueId}/guarded-closure`)
+      .send(body)
+      .expect(200);
+
+    await request(seeded.app)
+      .get(`/api/issues/${otherIssueId}/guarded-operations/${encodeURIComponent(body.operationId)}`)
+      .expect(404);
+    await expect(readIssue(otherIssueId)).resolves.toMatchObject({ status: "todo", statusVersion: 0, issueMutationVersion: 0 });
+  });
+
+  it("requires ordinary issue access to read guarded operation receipts", async () => {
+    const seeded = await seedIssue();
+    const body = {
+      operationId: "factory:no-change:auth-scoped",
+      operationKind: "verified_no_change_closure",
+      expectedStatus: "todo",
+      expectedStatusVersion: 0,
+      expectedMutationVersion: 0,
+      status: "done",
+      comment: "Closure receipt is scoped to issue visibility.",
+    };
+    await request(seeded.app)
+      .post(`/api/issues/${seeded.issueId}/guarded-closure`)
+      .send(body)
+      .expect(200);
+
+    const restrictedAgentId = randomUUID();
+    await ctx.db.insert(agents).values({
+      id: restrictedAgentId,
+      companyId: seeded.companyId,
+      name: `restricted-${restrictedAgentId}`,
+      role: "worker",
+      title: "Restricted",
+      capabilities: "",
+      adapterType: "process",
+      adapterConfig: {},
+      permissions: {},
+    });
+    const restrictedApp = routeApp(ctx.db, {
+      type: "agent",
+      source: "agent_jwt",
+      agentId: restrictedAgentId,
+      companyId: seeded.companyId,
+      keyId: randomUUID(),
+      keyScope: { kind: "task_bridge", parentIssueId: randomUUID() },
+    } as any, issueRoutes);
+
+    await request(restrictedApp)
+      .get(`/api/issues/${seeded.issueId}/guarded-operations/${encodeURIComponent(body.operationId)}`)
+      .expect(403);
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 1, operations: 1 });
+  });
+
+  it("allows receipt lookup after monitor authority is revoked without attempting a first mutation", async () => {
+    const seeded = await seedAgentIssue("in_review");
+    const body = {
+      operationId: "factory:observer:receipt-after-revoke",
+      operationKind: "guarded_status_update",
+      expectedStatus: "in_review",
+      expectedStatusVersion: 0,
+      expectedMutationVersion: 1,
+      status: "in_review",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          kind: "external_service",
+          nextCheckAt: "2026-09-06T12:00:00.000Z",
+          serviceName: "Software Factory",
+          externalRef: "chain:receipt-after-revoke",
+          scheduledBy: "assignee",
+          maxAttempts: 6,
+          recoveryPolicy: "wake_owner",
+        },
+      },
+    };
+
+    await request(seeded.agentApp)
+      .post(`/api/issues/${seeded.issueId}/guarded-status`)
+      .send(body)
+      .expect(200);
+    await ctx.db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, seeded.agentId));
+    const scopedApp = routeApp(ctx.db, {
+      type: "agent",
+      source: "agent_jwt",
+      agentId: seeded.agentId,
+      companyId: seeded.companyId,
+      keyId: randomUUID(),
+      keyScope: { kind: "task_bridge", parentIssueId: randomUUID() },
+    } as any, issueRoutes);
+
+    const receipt = await request(scopedApp)
+      .get(`/api/issues/${seeded.issueId}/guarded-operations/${encodeURIComponent(body.operationId)}`)
+      .expect(200);
+    expect(receipt.body).toMatchObject({
+      issueId: seeded.issueId,
+      operationId: body.operationId,
+      operationKind: "guarded_status_update",
+      applied: true,
+      response: { applied: true, issue: { id: seeded.issueId, status: "in_review" } },
+    });
+    await expect(countRows(seeded.issueId)).resolves.toEqual({ comments: 0, operations: 1 });
+  });
+
   it("rejects a reused operation identity with a changed body", async () => {
     const seeded = await seedIssue();
     const body = {

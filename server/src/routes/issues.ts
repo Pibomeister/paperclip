@@ -8858,6 +8858,21 @@ export function issueRoutes(
     res.status(result.applied ? 200 : 409).json(result);
   }
 
+
+  router.get("/issues/:id/guarded-operations/:operationId", async (req, res) => {
+    const id = req.params.id as string;
+    const operationId = req.params.operationId as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    const receipt = await svc.getGuardedStatusOperationReceipt(existing.companyId, existing.id, operationId);
+    if (!receipt) {
+      res.status(404).json({ error: "Issue status operation not found" });
+      return;
+    }
+    res.json(receipt);
+  });
+
   router.post("/issues/:id/guarded-status", validateIssueMutationBody(guardedIssueStatusOperationSchema), applyGuardedIssueStatusOperation);
 
   router.post("/issues/:id/guarded-closure", validateIssueMutationBody(guardedIssueClosureSchema), applyGuardedIssueStatusOperation);
